@@ -1,0 +1,40 @@
+{
+    "name": "DatastreamEvent",
+    "version" : 1,
+    "namespace": "com.linkedin.datastream.common",
+    "type": "record",
+    "fields": [
+        {
+            "name": "metadata",
+            "doc": "Event metadata.",
+            "type": {
+                "type": "map",
+                "values": "string"
+            }
+        },
+        {
+            "name": "key",
+            "doc" : "serialized key.",
+            "type": {
+                "type": "bytes",
+                "default": null
+            }
+        },
+        {
+            "name": "payload",
+            "doc" : "serialized payload data.",
+            "type": {
+                "type": "bytes",
+                "default": null
+            }
+        },
+        {
+            "name": "previous_payload",
+            "doc" : "serialized previous payload data.",
+            "type": {
+                "type": "bytes",
+                "default": null
+            }
+        }
+    ]
+}

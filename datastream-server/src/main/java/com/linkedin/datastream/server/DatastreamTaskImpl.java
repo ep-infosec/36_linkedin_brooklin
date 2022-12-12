@@ -1,0 +1,537 @@
+/**
+ *  Copyright 2019 LinkedIn Corporation. All rights reserved.
+ *  Licensed under the BSD 2-Clause License. See the LICENSE file in the project root for license information.
+ *  See the NOTICE file in the project root for additional information regarding copyright ownership.
+ */
+package com.linkedin.datastream.server;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import org.apache.commons.lang.Validate;
+import org.jetbrains.annotations.TestOnly;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+
+import com.linkedin.datastream.common.Datastream;
+import com.linkedin.datastream.common.DatastreamDestination;
+import com.linkedin.datastream.common.DatastreamMetadataConstants;
+import com.linkedin.datastream.common.DatastreamRuntimeException;
+import com.linkedin.datastream.common.DatastreamSource;
+import com.linkedin.datastream.common.DatastreamTransientException;
+import com.linkedin.datastream.common.DatastreamUtils;
+import com.linkedin.datastream.common.JsonUtils;
+import com.linkedin.datastream.common.LogUtils;
+import com.linkedin.datastream.serde.SerDeSet;
+import com.linkedin.datastream.server.zk.ZkAdapter;
+
+
+/**
+ * DatastreamTask is the minimum assignable element of a Datastream. It is mainly used to partition the datastream
+ * defined by Datastream. For example, the user can define an instance of Datastream for an Oracle bootstrap
+ * connector, but this logical datastream can be split into a number of DatastreamTask instances, each is tied
+ * to one partition. This way, each instance of DatastreamTask can be assigned independently, which in turn can
+ * result in bigger output and better concurrent IO.
+ *
+ * <p>DatastreamTask is used as input for specific connectors. Besides the reference of the original
+ * Datastream object, DatastreamTask also contains key-value store Properties. This allows the assignment
+ * strategy to attach extra parameters.
+ *
+ * <p>DatastreamTask has a unique name called _datastreamtaskName. This is used as the znode name in ZooKeeper
+ * This should be unique for each instance of DatastreamTask, especially in the case when a Datastream is
+ * split into multiple DatastreamTasks. This is because we will have a state associated with each DatastreamTask.
+ *
+ */
+public class DatastreamTaskImpl implements DatastreamTask {
+
+  private static final Logger LOG = LoggerFactory.getLogger(DatastreamTask.class.getName());
+
+  private static final String STATUS = "STATUS";
+  private volatile List<Datastream> _datastreams;
+
+  private HashMap<Integer, String> _checkpoints = new HashMap<>();
+
+  // connector type. Type of the connector to be used for reading the change capture events
+  // from the source, e.g. Oracle-Change, Espresso-Change, Oracle-Bootstrap, Espresso-Bootstrap,
+  // Mysql-Change etc..
+  private String _connectorType;
+
+  // The Id of the datastream task. It is a string that will represent one assignable element of
+  // datastream. By default, the value is empty string, representing that the DatastreamTask is by default
+  // mapped to one Datastream. Each of the _id value will be represented in ZooKeeper
+  // under /{cluster}/connectors/{connectorType}/{datastream}/{id}.
+  private String _id = "";
+
+  private String _taskPrefix;
+
+  // List of partitions the task covers.
+  private List<Integer> _partitions;
+  // This list is used to save topic-partition list when partition assignment is enabled.
+  // TODO: Investigate the requirement to populate both _partition and _partitionV2 and cleanup if required.
+  private List<String> _partitionsV2;
+
+  private final List<String> _dependencies;
+
+  @JsonIgnore
+  public String getStats() {
+    return _stats;
+  }
+
+  @JsonIgnore
+  public String getStatsFromZK() {
+    return getState("stats");
+  }
+
+  @JsonIgnore
+  public void setStats(String stats) {
+    _stats = stats;
+  }
+
+  private String _stats = "";
+
+  // Status to indicate if instance has hooked up and process this object
+  private ZkAdapter _zkAdapter;
+
+  private DatastreamEventProducer _eventProducer;
+  private String _transportProviderName;
+  private SerDeSet _destinationSerDes = new SerDeSet(null, null, null);
+  // pre-calculate the hash to avoid frequent recalculation.
+  private int _hashCode;
+
+  /**
+   * Constructor for DatastreamTaskImpl.
+   * Initializes task partitions to an empty list.
+   * NOTE: The constructor is intended for tests only.
+   */
+  @TestOnly
+  public DatastreamTaskImpl() {
+    _partitions = new ArrayList<>();
+    _partitionsV2 = new ArrayList<>();
+    _dependencies = new ArrayList<>();
+    computeHashCode();
+  }
+
+  /**
+   * Constructor for DatastreamTaskImpl.
+   * Initializes task with the provided datastreams, a random task ID, and an empty list of partitions
+   */
+  public DatastreamTaskImpl(List<Datastream> datastreams) {
+    this(datastreams, UUID.randomUUID().toString(), new ArrayList<>());
+  }
+
+  /**
+   * Constructor for DatastreamTaskImpl.
+   * @param datastreams Datastreams associated with the task.
+   * @param id Task ID
+   * @param partitions Partitions associated with the task.
+   */
+  public DatastreamTaskImpl(List<Datastream> datastreams, String id, List<Integer> partitions) {
+    Validate.notEmpty(datastreams, "empty datastream");
+    Validate.notNull(id, "null id");
+
+    Datastream datastream = datastreams.get(0);
+    _connectorType = datastream.getConnectorName();
+    _transportProviderName = datastream.getTransportProviderName();
+    _datastreams = datastreams;
+    _taskPrefix = datastream.getMetadata().get(DatastreamMetadataConstants.TASK_PREFIX);
+    _id = id;
+    _partitions = new ArrayList<>();
+    _partitionsV2 = new ArrayList<>();
+
+    if (partitions != null && partitions.size() > 0) {
+      _partitions.addAll(partitions);
+      _partitionsV2.addAll(partitions.stream().map(Object::toString).collect(Collectors.toList()));
+    } else {
+      // Add [0, N) if source has N partitions
+      // Or add a default partition 0 otherwise
+      if (datastream.hasSource() && datastream.getSource().hasPartitions()) {
+        int numPartitions = datastream.getSource().getPartitions();
+        for (int i = 0; i < numPartitions; i++) {
+          _partitions.add(i);
+          _partitionsV2.add(String.valueOf(i));
+        }
+      } else {
+        _partitions.add(0);
+        //partitionV2 doesn't require a default partition
+      }
+    }
+    LOG.info("Created new DatastreamTask " + this);
+    _dependencies = new ArrayList<>();
+    computeHashCode();
+  }
+
+
+  /**
+   * Constructor for new DatastreamTaskImpl which inherits some partitions from previous Task
+   * We must generate a new UUID for task
+   * @param predecessor task which need to release the partitions
+   * @param partitionsV2 new partitions for this task
+   */
+  public DatastreamTaskImpl(DatastreamTaskImpl predecessor, Collection<String> partitionsV2) {
+    _dependencies = new ArrayList<>();
+    if (!predecessor._partitionsV2.isEmpty()) {
+      if (!predecessor.isLocked()) {
+        throw new DatastreamTransientException("task " + predecessor.getDatastreamTaskName() + " is not locked, " +
+            "the previous assignment has not been picked up");
+      }
+      _dependencies.add(predecessor.getDatastreamTaskName());
+    }
+
+    _datastreams = predecessor._datastreams;
+    _taskPrefix = predecessor._taskPrefix;
+    _connectorType = predecessor._connectorType;
+    _id = UUID.randomUUID().toString();
+    _transportProviderName = predecessor._transportProviderName;
+    _partitions = new ArrayList<>();
+    _partitionsV2 = new ArrayList<>(partitionsV2);
+
+    _zkAdapter = predecessor._zkAdapter;
+    _eventProducer = predecessor._eventProducer;
+    _checkpoints = predecessor._checkpoints;
+    _transportProviderName = predecessor._transportProviderName;
+    _destinationSerDes = predecessor._destinationSerDes;
+
+    computeHashCode();
+  }
+
+    /**
+     * Get the prefix of the task names that will be created for this datastream.
+     */
+  public static String getTaskPrefix(Datastream datastream) {
+    return datastream.getName();
+  }
+
+  /**
+   * Construct DatastreamTask from json string
+   * @param  json JSON string of the task
+   */
+  public static DatastreamTaskImpl fromJson(String json) {
+    DatastreamTaskImpl task = JsonUtils.fromJson(json, DatastreamTaskImpl.class);
+    LOG.info("Loaded existing DatastreamTask: {}", task);
+    return task;
+  }
+
+  /**
+   * Get DatastreamTask serialized as JSON
+   */
+  public String toJson() throws IOException {
+    return JsonUtils.toJson(this);
+  }
+
+  @JsonIgnore
+  public String getDatastreamTaskName() {
+    return _id.equals("") ? _taskPrefix : _taskPrefix + "_" + _id;
+  }
+
+  @JsonIgnore
+  @Override
+  public boolean isUserManagedDestination() {
+    return DatastreamUtils.isUserManagedDestination(_datastreams.get(0));
+  }
+
+  @JsonIgnore
+  @Override
+  public DatastreamSource getDatastreamSource() {
+    return _datastreams.get(0).getSource();
+  }
+
+  @JsonIgnore
+  @Override
+  public DatastreamDestination getDatastreamDestination() {
+    return _datastreams.get(0).getDestination();
+  }
+
+  @Override
+  public List<Integer> getPartitions() {
+    return _partitions;
+  }
+
+  @Override
+  public List<String> getPartitionsV2() {
+    return Collections.unmodifiableList(_partitionsV2);
+  }
+
+  /**
+   * Set partitions associated with the task.
+   * @param partitions List of partitions to associate with task.
+   */
+  public void setPartitions(List<Integer> partitions) {
+    Validate.notNull(partitions);
+    _partitions = partitions;
+    computeHashCode();
+  }
+
+  /**
+   * Set partitions associated with the task. This setter is required for json deserialization
+   * @param partitionsV2 List of partitions to associate with task.
+   */
+  public void setPartitionsV2(List<String> partitionsV2) {
+    Validate.notNull(partitionsV2);
+    _partitionsV2 = partitionsV2;
+    computeHashCode();
+  }
+
+  @JsonIgnore
+  @Override
+  public Map<Integer, String> getCheckpoints() {
+    return _checkpoints;
+  }
+
+  public void setCheckpoints(Map<Integer, String> checkpoints) {
+    _checkpoints = new HashMap<>(checkpoints);
+  }
+
+  /**
+   * Get the list of datastreams for the datastream task. Note that the datastreams may change
+   * between onAssignmentChange (because of datastream update for example). It's connector's
+   * responsibility to re-fetch the datastream list even when it receives the exact same set
+   * of datastream tasks.
+   */
+  @JsonIgnore
+  @Override
+  public List<Datastream> getDatastreams() {
+    if (_datastreams == null || _datastreams.size() == 0) {
+      throw new IllegalArgumentException("Fetch datastream from zk stored task is not allowed");
+    }
+    return Collections.unmodifiableList(_datastreams);
+  }
+
+  /**
+   * Set datastreams associated with the task.
+   * @param datastreams List of datastreams associated with task.
+   */
+  public void setDatastreams(List<Datastream> datastreams) {
+    _datastreams = datastreams;
+    // destination and connector type should be immutable
+    _transportProviderName = _datastreams.get(0).getTransportProviderName();
+    _connectorType = _datastreams.get(0).getConnectorName();
+    computeHashCode();
+  }
+
+  @Override
+  public void acquire(Duration timeout) {
+    Validate.notNull(_zkAdapter, "Task is not properly initialized for processing.");
+    if (!_dependencies.isEmpty()) {
+      _zkAdapter.waitForDependencies(this, timeout);
+    }
+    try {
+      // Need to confirm the dependencies for task are not locked
+      _dependencies.forEach(predecessor -> {
+        if (_zkAdapter.checkIsTaskLocked(this.getConnectorType(), this.getTaskPrefix(), predecessor)) {
+          String msg = String.format("previous task %s failed to release lock in %dms for task %s", predecessor,
+              timeout.toMillis(), this.getDatastreamTaskName());
+          throw new DatastreamRuntimeException(msg);
+        }
+      });
+
+      _zkAdapter.acquireTask(this, timeout);
+    } catch (Exception e) {
+      LOG.error(String.format("Failed to acquire task: %s with dependencies: %s", this.getDatastreamTaskName(),
+          String.join(",", this.getDependencies())), e);
+      setStatus(DatastreamTaskStatus.error("Acquire failed, exception: " + e));
+      throw e;
+    }
+  }
+
+  /**
+   * check if task has acquired lock
+   */
+  @JsonIgnore
+  public boolean isLocked() {
+    Validate.notNull(_zkAdapter, "Task is not properly initialized for processing.");
+    return _zkAdapter.checkIsTaskLocked(_connectorType, this.getTaskPrefix(), this.getDatastreamTaskName());
+  }
+
+  @Override
+  public void release() {
+    Validate.notNull(_zkAdapter, "Task is not properly initialized for processing.");
+    _zkAdapter.releaseTask(this);
+  }
+
+  @JsonIgnore
+  public DatastreamEventProducer getEventProducer() {
+    return _eventProducer;
+  }
+
+  public void setEventProducer(DatastreamEventProducer eventProducer) {
+    _eventProducer = eventProducer;
+  }
+
+  /**
+   * Set destination serde
+   */
+  public void assignSerDes(SerDeSet destination) {
+    _destinationSerDes = destination;
+  }
+
+  public String getConnectorType() {
+    return _connectorType;
+  }
+
+  /**
+   * set connector type
+   * @param connectorType connector type
+   */
+  public void setConnectorType(String connectorType) {
+    _connectorType = connectorType;
+    computeHashCode();
+  }
+
+  @Override
+  public String getTransportProviderName() {
+    return _transportProviderName;
+  }
+
+  public void setTransportProviderName(String transportProviderName) {
+    _transportProviderName = transportProviderName;
+  }
+
+  public String getId() {
+    return _id;
+  }
+
+  /**
+   * set id
+   * @param id id for the task
+   */
+  public void setId(String id) {
+    _id = id;
+    computeHashCode();
+  }
+
+  public String getTaskPrefix() {
+    return _taskPrefix;
+  }
+
+  /**
+   * set taskPrefix
+   * @param taskPrefix Prefix for the task
+   */
+  public void setTaskPrefix(String taskPrefix) {
+    _taskPrefix = taskPrefix;
+    computeHashCode();
+  }
+
+  @JsonIgnore
+  @Override
+  public String getState(String key) {
+    return _zkAdapter.getDatastreamTaskStateForKey(this, key);
+  }
+
+  @JsonIgnore
+  @Override
+  public void saveState(String key, String value) {
+    Validate.notEmpty(key, "Key cannot be null or empty");
+    Validate.notEmpty(value, "value cannot be null or empty");
+    _zkAdapter.setDatastreamTaskStateForKey(this, key, value);
+  }
+
+  @JsonIgnore
+  @Override
+  public SerDeSet getDestinationSerDes() {
+    return _destinationSerDes;
+  }
+
+  @JsonIgnore
+  @Override
+  public DatastreamTaskStatus getStatus() {
+    String statusStr = getState(STATUS);
+    if (statusStr != null && !statusStr.isEmpty()) {
+      return JsonUtils.fromJson(statusStr, DatastreamTaskStatus.class);
+    }
+    return null;
+  }
+
+  @JsonIgnore
+  @Override
+  public void setStatus(DatastreamTaskStatus status) {
+    saveState(STATUS, JsonUtils.toJson(status));
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    DatastreamTaskImpl task = (DatastreamTaskImpl) o;
+    return Objects.equals(_connectorType, task._connectorType) && Objects.equals(_id, task._id) && Objects.equals(
+        _taskPrefix, task._taskPrefix) && Objects.equals(new HashSet<>(_partitions), new HashSet<>(task._partitions))
+        && Objects.equals(new HashSet<>(_partitionsV2), new HashSet<>(task._partitionsV2));
+  }
+
+  @Override
+  public int hashCode() {
+    return _hashCode;
+  }
+
+  private void computeHashCode() {
+    _hashCode = Objects.hash(_connectorType, _id, _taskPrefix, new HashSet<>(_partitions), new HashSet<>(_partitionsV2));
+  }
+
+  @Override
+  public String toString() {
+    // toString() is mainly for logging purpose, feel free to modify the content/format
+    // When DatastreamTaskImpl is created using constructor that passes _partitionsV2, _partitions is not populated.
+    // When DatastreamTaskImpl is created using constructor that passes _partitions, _partitionsV2 is also populated.
+    // So, if _partitions is not populated, we can assume that only _partitionsV2 is populated.
+    String partitionsV2FormatLog = String.join(",", _partitionsV2);
+    if (_partitions.size() > 0) {
+      try {
+        List<Integer> partitionList = _partitionsV2.stream().map(Integer::parseInt).collect(Collectors.toList());
+        partitionsV2FormatLog = LogUtils.logNumberArrayInRange(partitionList);
+      } catch (NumberFormatException e) {
+        LOG.error(e.getMessage());
+      }
+    } else { // this will be called for low level kafka connector.
+      partitionsV2FormatLog = LogUtils.logSummarizedTopicPartitionsMapping(_partitionsV2);
+    }
+    return String.format("%s(%s), partitionsV2=%s, partitions=%s, dependencies=%s", getDatastreamTaskName(),
+        _connectorType, partitionsV2FormatLog, LogUtils.logNumberArrayInRange(_partitions),
+        _dependencies);
+  }
+
+  public void setZkAdapter(ZkAdapter adapter) {
+    _zkAdapter = adapter;
+  }
+
+  /**
+   * Update checkpoint info for given partition inside the task.
+   * @param partition Partition whose checkpoint needs to be updated.
+   * @param checkpoint Checkpoint to update to.
+   */
+  public void updateCheckpoint(int partition, String checkpoint) {
+    LOG.debug("Update checkpoint called for partition {} and checkpoint {}", partition, checkpoint);
+    _checkpoints.put(partition, checkpoint);
+  }
+
+  // required for json deserialization
+  public List<String> getDependencies() {
+    return _dependencies;
+  }
+
+  /**
+   * Add a precedent task to this task
+   */
+  public void addDependency(DatastreamTaskImpl task) {
+    if (!task.isLocked()) {
+      throw new DatastreamTransientException("task " + task.getDatastreamTaskName() + " is not locked, "
+          + "the previous movement/assignment has not been picked up");
+    }
+    _dependencies.add(task.getDatastreamTaskName());
+  }
+}
